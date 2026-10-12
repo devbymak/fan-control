@@ -916,7 +916,7 @@ final class CoolingModel: ObservableObject {
                 }
                 // After limits and the curve are loaded, so the last mode or a rule can start Curve at launch. The last
                 // mode first: a plugged-in rule only starts from Auto, so it never overrides it.
-                self.restoreLastMode()
+                self.resumeMode()
                 self.applyRules()
                 self.onUpdate?()
             }
@@ -928,26 +928,45 @@ final class CoolingModel: ObservableObject {
     /// A mode picked by hand, from the popover, the menu, the hot key or a link. Remembered so Baadgir starts it again
     /// when it next opens; modes set by rules, returns to Auto for safety, sleep and quitting don't change it.
     func choose(_ newMode: FanMode) {
-        restoredLastMode = true  // A pick by hand replaces any restore still waiting at launch.
+        resuming = nil  // A pick by hand replaces any restore still waiting at launch or after wake.
+        sleptMode = nil
         select(newMode)
         // Only a mode that took effect: a refused pick mustn't start by itself at the next launch.
         if newMode == .auto || (sessionRunning && mode == newMode) { defaults.set(newMode.rawValue, forKey: "lastMode") }
     }
-    private var restoredLastMode = false
-    private let launchedAt = ProcessInfo.processInfo.systemUptime
-    /// At launch, after limits and the curve are loaded: starts the mode last picked by hand. Retried on each read for
-    /// the first 30 seconds, since fans still settling or readings not in yet can refuse it at first.
-    private func restoreLastMode() {
-        guard !restoredLastMode, initializedLimits, pending == nil else { return }
-        guard let last = defaults.string(forKey: "lastMode").flatMap(FanMode.init(rawValue:)), last != .auto, !fanless,
-              !sessionRunning, ProcessInfo.processInfo.systemUptime - launchedAt < 30 else { restoredLastMode = true; return }
+    /// A mode to start again by itself until `until` (monotonic seconds): at launch the mode last picked by hand, after
+    /// wake the mode sleep ended.
+    private var resuming: (mode: FanMode, until: Double)? = {
+        guard let last = UserDefaults.standard.string(forKey: "lastMode").flatMap(FanMode.init(rawValue:)),
+              last != .auto else { return nil }
+        return (last, ProcessInfo.processInfo.systemUptime + 30)
+    }()
+    /// The mode running when the Mac went to sleep.
+    private var sleptMode: FanMode?
+    /// Hands the fans back to macOS for sleep, remembering the mode so it starts again on wake.
+    func suspendForSleep() {
+        if sessionRunning, !stopRequested { sleptMode = mode }
+        endSession()
+    }
+    func resumeAfterWake() {
+        guard let sleptMode else { return }
+        self.sleptMode = nil
+        resuming = (sleptMode, ProcessInfo.processInfo.systemUptime + 30)
+    }
+    /// After limits and the curve are loaded: starts `resuming`. Retried on each read for 30 seconds, since fans still
+    /// settling, readings not in yet, or the session sleep ended still closing can refuse it at first.
+    private func resumeMode() {
+        guard let resuming, initializedLimits, pending == nil else { return }
+        guard !fanless, !sessionRunning, ProcessInfo.processInfo.systemUptime < resuming.until else {
+            self.resuming = nil; return
+        }
         // Not allowed now, rather than not ready yet: never start it later behind the person's back.
-        guard rules.blocker(for: last, on: currentPowerSource()) == nil else {
-            restoredLastMode = true; return
+        guard rules.blocker(for: resuming.mode, on: currentPowerSource()) == nil else {
+            self.resuming = nil; return
         }
         guard !externallyControlled else { return }
-        select(last)
-        if sessionRunning { restoredLastMode = true }
+        select(resuming.mode)
+        if sessionRunning { self.resuming = nil }
     }
     func select(_ newMode: FanMode) {
         message = nil
@@ -1258,13 +1277,13 @@ struct PopoverView: View {
         case .auto where model.externallyControlled:
             return "Choose Off to hand the fans back to macOS."
         case .auto:
-            return "macOS controls the fans. Curve and Fixed stay on until you choose Off, and starts again when Baadgir opens. For full speed, right-click the menu bar icon or press ⌃⌥M."
+            return "macOS controls the fans. Curve and Fixed stay on until you choose Off, and start again after sleep and when Baadgir opens. For full speed, right-click the menu bar icon or press ⌃⌥M."
         case .curve:
-            return "Follows your curve when it wants more than macOS, and goes to full speed if your Mac gets too hot. Changes apply right away. Hands the fans back to macOS on sleep or quit."
+            return "Follows your curve when it wants more than macOS, and goes to full speed if your Mac gets too hot. Changes apply right away. Hands the fans back to macOS on quit, and while your Mac sleeps."
         case .manual:
-            return "Drag to change speed. Never runs below the safe minimum when hot, and hands the fans back to macOS at 80°C, a hot battery or SSD, high thermal pressure, sleep, quit, or if monitoring fails."
+            return "Drag to change speed. Never runs below the safe minimum when hot, and hands the fans back to macOS at 80°C, a hot battery or SSD, high thermal pressure, quit, or if monitoring fails, and while your Mac sleeps."
         case .maximum:
-            return "Fans run at full speed until you choose another mode, sleep, or quit."
+            return "Fans run at full speed until you choose another mode or quit, resting while your Mac sleeps."
         }
     }
     private var thermalColor: Color {
@@ -1853,7 +1872,8 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         model.confirmRemote = { [weak self] mode, rpm, starts in self?.confirmRemote(mode, rpm: rpm, startsSession: starts) ?? false }
         timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.model.refresh() }
         RunLoop.main.add(timer!, forMode: .common)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(stop), name: NSWorkspace.willSleepNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(willSleep), name: NSWorkspace.willSleepNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(didWake), name: NSWorkspace.didWakeNotification, object: nil)
         removeStaleSessions()
         UNUserNotificationCenter.current().delegate = self
         model.onHotKeyChange = { [weak self] in self?.updateHotKey() }
@@ -2162,7 +2182,8 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
-    @objc func stop() { model.endSession() }
+    @objc func willSleep() { model.suspendForSleep() }
+    @objc func didWake() { model.resumeAfterWake() }
     @objc func quitApp() { NSApp.terminate(nil) }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard model.sessionRunning else { return .terminateNow }
