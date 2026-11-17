@@ -497,8 +497,9 @@ func startWatchdog(executable: String) throws -> Int32 {
     // Inherit nothing else (notably the session lock) and leave this process group's signals behind.
     posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETPGROUP))
     posix_spawnattr_setpgroup(&attributes, 0)
-    // Typed explicitly: older Swift compilers can't infer the element type of the mapped array.
-    let argv: [UnsafeMutablePointer<CChar>?] = [executable, "--watchdog"].map { strdup($0) } + [nil]
+    // Built in steps with explicit types: older Swift compilers read the literal as C pointers otherwise.
+    let arguments: [String] = [executable, "--watchdog"]
+    let argv: [UnsafeMutablePointer<CChar>?] = arguments.map { strdup($0) } + [nil]
     defer { argv.forEach { free($0) } }
     var pid: pid_t = 0
     let result = posix_spawn(&pid, executable, &actions, &attributes, argv, environ)
