@@ -13,7 +13,9 @@ for size in 16 32 128 256 512; do
 done
 mkdir -p .build/module-cache
 cache_path="$(cd .build/module-cache && pwd -P)"
-xcrun swift -module-cache-path "$cache_path" sources/icon.swift .build/app-icon.iconset 'Fan Control.app/Contents/Resources/app-icon.icns'
+# iconutil, not a hand-built ICNS: macOS misreads small PNGs stored under the icp4/icp5 types, so 16 and 32 point icons
+# (Login Items, list views) showed noise.
+iconutil -c icns .build/app-icon.iconset -o 'Fan Control.app/Contents/Resources/app-icon.icns'
 xcrun swiftc -target arm64-apple-macosx13.0 -module-cache-path "$cache_path" -swift-version 5 -O -framework AppKit -framework IOKit -framework ServiceManagement -framework UserNotifications -framework Carbon sources/policy.swift sources/graph.swift sources/main.swift -o 'Fan Control.app/Contents/MacOS/fancontrol'
 cat > 'Fan Control.app/Contents/Info.plist' <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
