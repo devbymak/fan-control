@@ -1,4 +1,4 @@
-// Release scripts: run with `node --test scripts/`.
+// Release scripts: run with `node --test scripts/*.test.mjs`.
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { mkdtempSync, readFileSync } from 'node:fs'
