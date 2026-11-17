@@ -186,9 +186,9 @@ func thermalLevel() -> ThermalLevel {
 }
 var interrupted: sig_atomic_t = 0
 func handleSignal(_ signal: Int32) { interrupted = 1 }
-/// Root-owned copy of the executable, installed by `build.sh --install`. Root never runs the app bundle's copy,
+/// Root-owned copy of the executable, installed by the Homebrew cask or `build.sh --install`. Root never runs the app bundle's copy,
 /// which any app running as the user could replace.
-let helperPath = "/Library/PrivilegedHelperTools/local.baadgir.helper"
+let helperPath = "/Library/PrivilegedHelperTools/local.fancontrol.helper"
 /// Refuses fan control unless this process is root running the root-owned helper.
 func requireRootHelper() throws {
     guard geteuid() == 0 else { throw Failure("Fan control requires administrator authorization") }
@@ -200,7 +200,7 @@ func requireRootHelper() throws {
     }
     defer { free(resolved) }
     guard String(cString: resolved) == helperPath, isRootOwned(helperPath) else {
-        throw Failure("Fan control runs only from the installed helper. Run ./build.sh --install.")
+        throw Failure("Fan control runs only from the installed helper. Reinstall Fan Control.")
     }
 }
 /// The user a process runs as.
@@ -209,7 +209,7 @@ func processOwner(_ pid: pid_t) throws -> uid_t {
     var size = MemoryLayout<kinfo_proc>.stride
     var request: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
     guard sysctl(&request, 4, &info, &size, nil, 0) == 0, size == MemoryLayout<kinfo_proc>.stride else {
-        throw Failure("Cannot identify Baadgir's user")
+        throw Failure("Cannot identify Fan Control's user")
     }
     return info.kp_eproc.e_ucred.cr_uid
 }
@@ -218,7 +218,7 @@ func processOwner(_ pid: pid_t) throws -> uid_t {
 /// One message for every refusal: anyone can run this as root through the sudo rule, so it mustn't reveal whether a
 /// path they can't see exists, or who owns it.
 func openSessionDirectory(_ path: String, owner: uid_t) throws -> Int32 {
-    let invalid = Failure("Cooling session folder is unavailable or not private to Baadgir's user")
+    let invalid = Failure("Cooling session folder is unavailable or not private to Fan Control's user")
     let folder = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
     guard folder >= 0 else { throw invalid }
     var info = stat()
@@ -230,7 +230,7 @@ func openSessionDirectory(_ path: String, owner: uid_t) throws -> Int32 {
 }
 /// In a folder only root can write (unlike /var/run, which the daemon group can), so nothing else can hold the lock
 /// and keep the watchdog from restoring Auto.
-let lockPath = "/var/db/local.baadgir.lock"
+let lockPath = "/var/db/local.fancontrol.lock"
 func acquireLock() throws -> Int32 {
     let lock = open(lockPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
     guard lock >= 0 else { throw Failure("Cannot create cooling session lock") }
@@ -290,7 +290,7 @@ func coolingSession(parent: pid_t, directory: String) throws {
     func requestedTarget() throws -> CoolingTarget {
         let (target, modified) = try readControl(in: folder, owner: owner)
         guard heartbeat.isFresh(stamp: modified, now: ProcessInfo.processInfo.systemUptime) else {
-            throw Failure("Baadgir stopped responding; returning to automatic cooling")
+            throw Failure("Fan Control stopped responding; returning to automatic cooling")
         }
         switch target {
         case .manual(let rpm):
@@ -338,12 +338,12 @@ func coolingSession(parent: pid_t, directory: String) throws {
             retryDelay: { usleep(100_000) })
     }
     /// Targets written recently. The SMC applies a new target a moment after the write and can drop one that follows
-    /// another closely, so reading back the latest, or one replaced within `settle`, still means Baadgir holds the fan;
+    /// another closely, so reading back the latest, or one replaced within `settle`, still means Fan Control holds the fan;
     /// any other value means something else changed it. Timed from the replacement, not the write: Curve can hold one
     /// speed for minutes before stepping down.
     var written: [(targets: [Float], at: ContinuousClock.Instant)] = []
     let settle = Duration.seconds(5)
-    /// Per-fan targets while Baadgir holds the fans; nil while macOS controls them (Curve mode only).
+    /// Per-fan targets while Fan Control holds the fans; nil while macOS controls them (Curve mode only).
     var applied: [Float]? {
         didSet {
             guard let applied else { written.removeAll(); return }
@@ -559,7 +559,7 @@ func restoreAutomatic(locking: Bool = true) throws {
 
 final class CoolingModel: ObservableObject {
     @Published var fans: [Fan] = []
-    /// No fans at all, such as a MacBook Air: Baadgir only shows temperatures. False until the first fan read.
+    /// No fans at all, such as a MacBook Air: Fan Control only shows temperatures. False until the first fan read.
     @Published private(set) var fanless = false {
         didSet { if fanless != oldValue { onLayoutChange?(); onHotKeyChange?() } }
     }
@@ -587,7 +587,7 @@ final class CoolingModel: ObservableObject {
     @Published var stacksMenuBarReadings = UserDefaults.standard.bool(forKey: "stacksMenuBarReadings") {
         didSet { defaults.set(stacksMenuBarReadings, forKey: "stacksMenuBarReadings"); onLayoutChange?() }
     }
-    /// The fan symbol before the readings; filled while Baadgir controls the fans.
+    /// The fan symbol before the readings; filled while Fan Control holds the fans.
     @Published var showsMenuBarIcon = UserDefaults.standard.object(forKey: "showsMenuBarIcon") as? Bool ?? false {
         didSet { defaults.set(showsMenuBarIcon, forKey: "showsMenuBarIcon"); onLayoutChange?() }
     }
@@ -630,12 +630,12 @@ final class CoolingModel: ObservableObject {
     }
     @Published var hotKeyError: String?
     var onHotKeyChange: (() -> Void)?
-    /// Whether baadgir:// links (and so Shortcuts and the command line) may change the fan mode.
+    /// Whether fancontrol:// links (and so Shortcuts and the command line) may change the fan mode.
     /// Off until turned on: any web page or app can open a link.
     @Published var allowsLinks = UserDefaults.standard.object(forKey: "allowsLinks") as? Bool ?? false {
         didSet { defaults.set(allowsLinks, forKey: "allowsLinks") }
     }
-    /// Asks in Baadgir before a request from outside starts cooling or picks a manual speed: the mode, the manual RPM,
+    /// Asks in Fan Control before a request from outside starts cooling or picks a manual speed: the mode, the manual RPM,
     /// and whether it starts a session. Nil or false declines.
     var confirmRemote: ((FanMode, Double?, Bool) -> Bool)?
     /// Runs a request from a link, Shortcuts, or the command line, with the same checks as the popover.
@@ -767,7 +767,7 @@ final class CoolingModel: ObservableObject {
         var points = curve.points
         let previous = index > 0 ? points[index - 1] : nil, next = index < points.count - 1 ? points[index + 1] : nil
         let coolest = previous.map { $0.temperature + 1 } ?? FanCurve.lowestTemperature
-        let hottest = next.map { $0.temperature - 1 } ?? CoolingPolicy.stopLimit - 1
+        let hottest = next.map { $0.temperature - 1 } ?? CoolingPolicy.curveLimit - 1
         let degrees = min(max(temperature.rounded(), coolest), hottest)
         // The safe minimum rises with temperature, so it never passes the next point, which already meets it.
         let slowest = max(previous?.rpm ?? 0, SafeMinimum.rpm(at: degrees, hardware: bounds), ceil(bounds.minimum))
@@ -791,7 +791,7 @@ final class CoolingModel: ObservableObject {
     }
     var bounds: HardwareBounds?
     var onUpdate: (() -> Void)?
-    private let queue = DispatchQueue(label: "local.baadgir.sensors")
+    private let queue = DispatchQueue(label: "local.fancontrol.sensors")
     private let defaults = UserDefaults.standard
     private var smc: SMC?
     private var reading = false
@@ -925,7 +925,7 @@ final class CoolingModel: ObservableObject {
 
     // MARK: Mode changes
 
-    /// A mode picked by hand, from the popover, the menu, the hot key or a link. Remembered so Baadgir starts it again
+    /// A mode picked by hand, from the popover, the menu, the hot key or a link. Remembered so Fan Control starts it again
     /// when it next opens; modes set by rules, returns to Auto for safety, sleep and quitting don't change it.
     func choose(_ newMode: FanMode) {
         resuming = nil  // A pick by hand replaces any restore still waiting at launch or after wake.
@@ -971,7 +971,7 @@ final class CoolingModel: ObservableObject {
     func select(_ newMode: FanMode) {
         message = nil
         if fanless, newMode != .auto {
-            message = "This Mac has no fans, so Baadgir only shows temperatures."; onUpdate?(); return
+            message = "This Mac has no fans, so Fan Control only shows temperatures."; onUpdate?(); return
         }
         if let reason = rules.blocker(for: newMode, on: currentPowerSource()) { message = reason; onUpdate?(); return }
         switch newMode {
@@ -1042,7 +1042,7 @@ final class CoolingModel: ObservableObject {
     private func startSession(_ newMode: FanMode) {
         guard helper == nil else { return }
         if notifiesOnReturn { requestNotificationPermission() }
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("baadgir-" + UUID().uuidString)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("fancontrol-" + UUID().uuidString)
         do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700]) }
         catch { message = "Cannot create cooling session: \(error)"; return }
         self.directory = directory
@@ -1063,7 +1063,7 @@ final class CoolingModel: ObservableObject {
         if let started {
             pending = started == .prompted ? "Waiting for administrator authorization…" : "Starting fan control…"
             activity = ProcessInfo.processInfo.beginActivity(options: .userInitiatedAllowingIdleSystemSleep,
-                                                             reason: "Baadgir is controlling the fans")
+                                                             reason: "Fan Control is controlling the fans")
         } else {
             sessionRunning = false; mode = .auto; self.directory = nil
             try? FileManager.default.removeItem(at: directory)
@@ -1086,11 +1086,11 @@ final class CoolingModel: ObservableObject {
             pending = "Restoring automatic cooling…"
         }
     }
-    /// How the helper was started: through the sudo rule that ./build.sh --install sets up, or through an
+    /// How the helper was started: through the sudo rule that the Homebrew cask or ./build.sh --install sets up, or through an
     /// administrator prompt when that rule is missing.
     enum PrivilegedLaunch { case direct, prompted }
     /// The sudo rule letting this user run the helper without a password. No dot in the name: sudo skips those.
-    private let sudoRulePath = "/etc/sudoers.d/baadgir"
+    private let sudoRulePath = "/etc/sudoers.d/fancontrol"
     /// Whether starting a session raises the administrator prompt.
     var needsPassword: Bool { !FileManager.default.fileExists(atPath: sudoRulePath) }
     /// Runs the root-owned helper as root. Returns nil if it could not launch.
@@ -1098,11 +1098,11 @@ final class CoolingModel: ObservableObject {
                                completion: @escaping (Bool, String) -> Void) -> PrivilegedLaunch? {
         // Never run as root, or hand the administrator password to, a file that another app running as this user could replace.
         guard isRootOwned(helperPath) else {
-            message = "The fan-control helper is not installed. Run ./build.sh --install."; return nil
+            message = "The fan-control helper is not installed. Reinstall Fan Control."; return nil
         }
         guard let executable = Bundle.main.executablePath,
               FileManager.default.contentsEqual(atPath: executable, andPath: helperPath) else {
-            message = "The fan-control helper doesn't match this Baadgir. Run ./build.sh --install."; return nil
+            message = "The fan-control helper doesn't match this app. Reinstall Fan Control."; return nil
         }
         // An empty environment: nothing set for this user's apps (such as via `launchctl setenv`) reaches root.
         let command = ["/usr/bin/env", "-i", helperPath] + arguments
@@ -1152,7 +1152,7 @@ final class CoolingModel: ObservableObject {
     private static func readableError(_ text: String) -> String {
         if text.contains("(-128)") { return "Administrator authorization was cancelled." }
         if text.contains("a password is required") {
-            return "Password-free fan control isn't set up for this account. Run ./build.sh --install again."
+            return "Password-free fan control isn't set up for this account. Reinstall Fan Control."
         }
         var text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if let range = text.range(of: "execution error: ") { text = String(text[range.upperBound...]) }
@@ -1172,7 +1172,7 @@ struct PopoverView: View {
                     Image(nsImage: icon).resizable().frame(width: 36, height: 36).accessibilityHidden(true)
                 } else { Image(systemName: "fan").font(.title2).accessibilityHidden(true) }
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Baadgir").font(.headline)
+                    Text("Fan Control").font(.headline)
                     Text(model.status).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -1242,7 +1242,7 @@ struct PopoverView: View {
             HStack {
                 Button("Settings…", action: openSettings).buttonStyle(.plain).foregroundStyle(.secondary)
                 Spacer()
-                Button("Quit Baadgir", action: quit).buttonStyle(.plain).foregroundStyle(.secondary)
+                Button("Quit Fan Control", action: quit).buttonStyle(.plain).foregroundStyle(.secondary)
             }
         }
         .padding(16)
@@ -1277,11 +1277,11 @@ struct PopoverView: View {
         case .auto where model.externallyControlled:
             return "Choose Off to hand the fans back to macOS."
         case .auto:
-            return "macOS controls the fans. Curve and Fixed stay on until you choose Off, and start again after sleep and when Baadgir opens. For full speed, right-click the menu bar icon or press ⌃⌥M."
+            return "macOS controls the fans. Curve and Fixed stay on until you choose Off, and start again after sleep and when Fan Control opens. For full speed, right-click the menu bar icon or press ⌃⌥M."
         case .curve:
             return "Follows your curve when it wants more than macOS, and goes to full speed if your Mac gets too hot. Changes apply right away. Hands the fans back to macOS on quit, and while your Mac sleeps."
         case .manual:
-            return "Drag to change speed. Never runs below the safe minimum when hot, and hands the fans back to macOS at 80°C, a hot battery or SSD, high thermal pressure, quit, or if monitoring fails, and while your Mac sleeps."
+            return "Drag to change speed. Never runs below a safe minimum when warm, and hands the fans back to macOS at 80°C, a hot battery or SSD, high thermal pressure, quit, or if monitoring fails, and while your Mac sleeps."
         case .maximum:
             return "Fans run at full speed until you choose another mode or quit, resting while your Mac sleeps."
         }
@@ -1361,7 +1361,7 @@ struct SettingsView: View {
                 set: { model.setLaunchAtLogin($0) }))
             if model.loginItemStatus == .requiresApproval {
                 HStack {
-                    Text("Allow Baadgir in Login Items to finish.").font(.caption).foregroundStyle(.orange)
+                    Text("Allow Fan Control in Login Items to finish.").font(.caption).foregroundStyle(.orange)
                     Spacer()
                     Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
                 }
@@ -1369,8 +1369,8 @@ struct SettingsView: View {
             if let error = model.loginItemError { warning(error) }
             if !model.fanless {
                 Toggle(isOn: $model.notifiesOnReturn) {
-                    Text("Notify when Baadgir turns fan control off")
-                    Text("When Baadgir hands the fans back to macOS on its own, such as after a safety cutoff.")
+                    Text("Notify when fan control turns off by itself")
+                    Text("When Fan Control hands the fans back to macOS on its own, such as after a safety cutoff.")
                 }
             }
         }
@@ -1476,7 +1476,7 @@ struct SettingsView: View {
         } header: {
             Text("Power")
         } footer: {
-            footer("The plugged-in rule runs when you connect power and when Baadgir starts while plugged in, only if fan control is off. Starting a mode may ask for your administrator password.")
+            footer("The plugged-in rule runs when you connect power and when Fan Control starts while plugged in, only if fan control is off. Starting a mode may ask for your administrator password.")
         }
         .disabled(model.bounds == nil)
         Section {
@@ -1487,7 +1487,7 @@ struct SettingsView: View {
             if let error = model.hotKeyError { warning(error) }
             Toggle(isOn: $model.allowsLinks) {
                 Text("Shortcuts, links, and command line")
-                Text("Let Shortcuts, baadgir:// links, and the command line change the fan mode. Baadgir still asks before starting cooling or setting a fixed speed.")
+                Text("Let Shortcuts, fancontrol:// links, and the command line change the fan mode. Fan Control still asks before starting cooling or setting a fixed speed.")
             }
         } header: {
             Text("Control")
@@ -1633,7 +1633,7 @@ struct HistoryView: View {
     }
 }
 
-/// The fan curve on a grid from 30°C to 80°C, where maximum takes over. Drag anywhere to move the nearest point.
+/// The fan curve on a grid from 30°C to 100°C, where maximum takes over. Drag anywhere to move the nearest point.
 struct CurveEditor: View {
     @ObservedObject var model: CoolingModel
     let curve: FanCurve
@@ -1644,7 +1644,7 @@ struct CurveEditor: View {
     @StateObject private var drag = Drag()
     final class Drag: ObservableObject { @Published var index: Int? }
     private var dragging: Int? { drag.index }
-    private let low = FanCurve.lowestTemperature, high = CoolingPolicy.stopLimit
+    private let low = FanCurve.lowestTemperature, high = CoolingPolicy.curveLimit
     private func point(_ temperature: Double, _ rpm: Double, in size: CGSize) -> CGPoint {
         CGPoint(x: (temperature - low) / (high - low) * size.width,
                 y: (1 - (rpm - bounds.minimum) / (bounds.maximum - bounds.minimum)) * size.height)
@@ -1859,7 +1859,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     private var symbol = "fan"
     func applicationDidFinishLaunching(_ notification: Notification) {
         fixStatusItemWidth()
-        item.button?.setAccessibilityLabel("Baadgir temperature and fan controls")
+        item.button?.setAccessibilityLabel("Fan Control: temperatures and fan modes")
         item.button?.target = self; item.button?.action = #selector(statusItemClicked)
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         popover.behavior = .transient
@@ -1901,7 +1901,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         if status != noErr { model.hotKeyError = "⌃⌥M is already used by another app." }
     }
     private var queuedCommands: [RemoteCommand] = []
-    /// Handles baadgir:// links from Shortcuts, the command line, or other apps.
+    /// Handles fancontrol:// links from Shortcuts, the command line, or other apps.
     func application(_ application: NSApplication, open urls: [URL]) {
         // Checked before parsing, so a link can't open the popover with its own text while links are off.
         guard model.allowsLinks else {
@@ -1931,11 +1931,11 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
         let alert = NSAlert()
         if startsSession {
             alert.messageText = "Start \(name) cooling?"
-            alert.informativeText = "A link, Shortcut, or command asked Baadgir to take over the fans."
+            alert.informativeText = "A link, Shortcut, or command asked Fan Control to take over the fans."
                 + (model.needsPassword ? " If you continue, macOS asks for your administrator password." : "")
         } else {
             alert.messageText = "Switch to \(name)?"
-            alert.informativeText = "A link, Shortcut, or command asked Baadgir to change the fan speed. Fixed can run the fans slower than macOS would."
+            alert.informativeText = "A link, Shortcut, or command asked Fan Control to change the fan speed. Fixed can run the fans slower than macOS would."
         }
         let accept = alert.addButton(withTitle: startsSession ? "Start" : "Switch")
         let cancel = alert.addButton(withTitle: "Cancel")
@@ -1970,7 +1970,7 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
     private func removeStaleSessions() {
         let temporary = FileManager.default.temporaryDirectory
         for name in (try? FileManager.default.contentsOfDirectory(atPath: temporary.path)) ?? []
-        where name.hasPrefix("baadgir-") {
+        where name.hasPrefix("fancontrol-") {
             try? FileManager.default.removeItem(at: temporary.appendingPathComponent(name))
         }
     }
@@ -1985,11 +1985,11 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
             updateTitle()
             if symbolChanged { item.button?.image = statusSymbol }
         }
-        item.button?.toolTip = "Baadgir · " + model.status
+        item.button?.toolTip = "Fan Control · " + model.status
     }
     private var stacked: Bool { model.stacksMenuBarReadings && model.shownMenuBarReadings.count > 1 }
     private var statusSymbol: NSImage? {
-        model.showsMenuBarIcon ? NSImage(systemSymbolName: symbol, accessibilityDescription: "Baadgir") : nil
+        model.showsMenuBarIcon ? NSImage(systemSymbolName: symbol, accessibilityDescription: "Fan Control") : nil
     }
     private func currentValue(_ reading: TemperatureReading) -> Double? { model.value(of: reading) }
     private var titleFont: NSFont { .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular) }
@@ -2131,11 +2131,11 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
             menu.addItem(entry)
         }
         if !model.fanless { menu.addItem(.separator()) }
-        let open = NSMenuItem(title: "Open Baadgir", action: #selector(togglePopover), keyEquivalent: "")
+        let open = NSMenuItem(title: "Open Fan Control", action: #selector(togglePopover), keyEquivalent: "")
         open.target = self; menu.addItem(open)
         let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
         settings.target = self; menu.addItem(settings)
-        let quit = NSMenuItem(title: "Quit Baadgir", action: #selector(quitApp), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "Quit Fan Control", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self; menu.addItem(quit)
         // Attach only while open so a left click still shows the popover.
         menu.delegate = self
@@ -2225,12 +2225,12 @@ func diagnostic() -> String {
 }
 let arguments = CommandLine.arguments
 let usage = """
-Usage: baadgir status | off | curve | fixed [RPM] | max
+Usage: fancontrol status | off | curve | fixed [RPM] | max
   status        Print fan and sensor readings (read-only).
-  off … max     Ask the running Baadgir app to change fan mode, with the same checks as the app.
+  off … max     Ask the running Fan Control app to change fan mode, with the same checks as the app.
 """
-let bundleIdentifier = "local.baadgir"
-/// Sends a request to the running Baadgir (launching the installed copy if needed) through its baadgir:// link.
+let bundleIdentifier = "local.fancontrol"
+/// Sends a request to the running Fan Control (launching the installed copy if needed) through its fancontrol:// link.
 func send(_ command: RemoteCommand) -> Int32 {
     let open = Process()
     open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
@@ -2261,11 +2261,11 @@ if arguments.dropFirst() == ["--probe"] || arguments.dropFirst() == ["status"] {
     }
 } else if geteuid() == 0 {
     // Root runs only the helper's modes above; the app itself, with its prompts and settings, runs as the user.
-    fputs("Baadgir's app doesn't run as root.\n", stderr); exit(1)
+    fputs("Fan Control doesn't run as root.\n", stderr); exit(1)
 } else if NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
             .contains(where: { $0.processIdentifier != getpid() }) {
     // Two copies would delete each other's session folders and fight over the fans.
-    fputs("Baadgir is already running.\n", stderr)
+    fputs("Fan Control is already running.\n", stderr)
 } else {
     let app = NSApplication.shared
     let delegate = MenuApp()

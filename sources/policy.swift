@@ -76,7 +76,7 @@ enum SensorKeys {
     /// An unknown chip's readings may come from keys that mean something else on it; it gets Auto and Max only.
     static func requireKnown(_ generation: Generation?) throws {
         guard generation != nil else {
-            throw Failure("Baadgir doesn't know this chip's temperature sensors, so only Off and Max are available")
+            throw Failure("Fan Control doesn't know this chip's temperature sensors, so only Off and Max are available")
         }
     }
     private static func unique(_ keys: [String]) -> [String] {
@@ -214,8 +214,8 @@ struct FanCurve: Equatable {
         guard points.count == Self.pointCount,
               points.allSatisfy({ $0.temperature.isFinite && $0.rpm.isFinite }),
               points.first!.temperature >= Self.lowestTemperature,
-              points.last!.temperature < CoolingPolicy.stopLimit else {
-            throw Failure("Curve temperatures must be between \(Int(Self.lowestTemperature))°C and \(Int(CoolingPolicy.stopLimit) - 1)°C")
+              points.last!.temperature < CoolingPolicy.curveLimit else {
+            throw Failure("Curve temperatures must be between \(Int(Self.lowestTemperature))°C and \(Int(CoolingPolicy.curveLimit) - 1)°C")
         }
         guard zip(points, points.dropFirst()).allSatisfy({ $0.temperature < $1.temperature }) else {
             throw Failure("Curve temperatures must increase from point to point")
@@ -250,7 +250,7 @@ enum CurvePreset: CaseIterable {
     /// On the safe minimum: Curve never wants more than macOS until the floor does, so the fans keep macOS's own
     /// cooling and only get the extra margin when hot.
     case system
-    /// Starts early and spreads the whole range from 55°C to 78°C.
+    /// Stays near the fans' minimum to 80°C, then spreads the rest of the range up to 97°C.
     case balanced
     /// Starts at 45°C and reaches maximum at 72°C, trading quiet for lower temperatures.
     case performance
@@ -264,8 +264,8 @@ enum CurvePreset: CaseIterable {
     func curve(for hardware: HardwareBounds) -> FanCurve {
         let temperatures: [Double], shares: [Double]
         switch self {
-        case .system: (temperatures, shares) = ([55, 65, 72, 78], [0, 0, 0, 0])
-        case .balanced: (temperatures, shares) = ([55, 65, 72, 78], [0, 0.3, 0.65, 1])
+        case .system: (temperatures, shares) = ([60, 80, 90, 95], [0, 0, 0, 0])
+        case .balanced: (temperatures, shares) = ([70, 80, 90, 97], [0, 0.15, 0.45, 1])
         case .performance: (temperatures, shares) = ([45, 55, 65, 72], [0.2, 0.45, 0.75, 1])
         }
         let low = ceil(hardware.minimum), high = floor(hardware.maximum)
@@ -277,12 +277,16 @@ enum CurvePreset: CaseIterable {
     }
 }
 
-/// The slowest Curve may run at each temperature, as a share of the fans' range: the minimum up to 65°C, a quarter
-/// of the range at 72°C, and half at 78°C. Interpolated between, flat after; from 80°C Curve runs at maximum anyway.
+/// The slowest Curve may run at each temperature, as a share of the fans' range: the minimum up to 80°C, a quarter
+/// of the range at 90°C, and half at 95°C. Interpolated between, flat after; from 100°C Curve runs at maximum anyway.
+/// Apple silicon runs at 90°C and above under load with macOS's own fans quiet, so the floor waits until then.
+/// Fixed, which stops at 80°C, keeps an earlier floor: the minimum up to 65°C, a quarter at 72°C, half at 78°C.
 /// A share of the range rather than fixed RPM, since fan ranges differ between Macs.
 enum SafeMinimum {
-    static let points: [(temperature: Double, share: Double)] = [(65, 0), (72, 0.25), (78, 0.5)]
-    static func rpm(at temperature: Double, hardware: HardwareBounds) -> Double {
+    typealias Points = [(temperature: Double, share: Double)]
+    static let points: Points = [(80, 0), (90, 0.25), (95, 0.5)]
+    static let fixedPoints: Points = [(65, 0), (72, 0.25), (78, 0.5)]
+    static func rpm(at temperature: Double, hardware: HardwareBounds, points: Points = SafeMinimum.points) -> Double {
         let share: Double
         if temperature <= points.first!.temperature { share = points.first!.share }
         else if let (a, b) = zip(points, points.dropFirst()).first(where: { temperature <= $1.temperature }) {
@@ -333,7 +337,7 @@ enum CoolingTarget: Equatable {
 /// A fan macOS has stopped (or runs below its minimum) counts as running at its minimum, so an idle Mac whose fans are off
 /// is handed back once the curve asks for no more than that.
 struct CurveController {
-    /// Curve must exceed the fans' actual speed by this much before Baadgir takes over.
+    /// Curve must exceed the fans' actual speed by this much before Fan Control takes over.
     static let engageMargin = 300.0
     /// How long the curve must sit at or below macOS's speed before handing the fans back.
     static let releaseDelay = 10.0
@@ -342,7 +346,7 @@ struct CurveController {
     /// How far the curve must fall below the applied speed before the fans start slowing, so small wobbles in the
     /// steadied temperature don't make them hunt. Once started, the ramp goes all the way down.
     static let holdMargin = 150.0
-    /// macOS's per-fan speeds when Baadgir took over; nil while macOS controls the fans.
+    /// macOS's per-fan speeds when Fan Control took over; nil while macOS controls the fans.
     private(set) var floors: [Double]?
     private(set) var applied: [Double]?
     private var belowSince: Double?
@@ -375,11 +379,12 @@ struct CurveController {
 }
 
 /// The temperature Curve follows: the hottest CPU/GPU reading, steadied so brief spikes don't make the fans hunt. It
-/// follows a rise within seconds and a fall more slowly, so it errs toward cooling. Only the curve lookup uses it: the
+/// follows a rise within about ten seconds, so a spike of a few seconds barely moves the fans, and a fall more
+/// slowly, so it errs toward cooling. Only the curve lookup uses it: the
 /// safe minimum, the stop limit, thermal pressure and the battery and SSD cutoffs still act on the raw readings.
 struct SteadyTemperature {
     /// Time constants in seconds: about two thirds of a step is followed in this time.
-    static let riseTime = 6.0, fallTime = 20.0
+    static let riseTime = 10.0, fallTime = 20.0
     private(set) var value: Double?
     private var time = 0.0
     /// `now` is monotonic seconds.
@@ -409,9 +414,11 @@ struct CoolingPolicy {
     static let heartbeatTimeout = 10.0
     /// The watchdog kills the helper and restores Auto when the helper's loop stalls for this long.
     static let helperStallTimeout = 15.0
-    // Conservative software cutoffs, not manufacturer-certified limits.
+    // Conservative software cutoffs, not manufacturer-certified limits. Fixed starts below startLimit and stops at
+    // stopLimit; Curve runs maximum from curveLimit, well below where Apple silicon throttles itself.
     static let startLimit = 75.0
     static let stopLimit = 80.0
+    static let curveLimit = 100.0
     static let batteryLimit = 45.0
     static let ssdLimit = 70.0
     /// Battery and SSD are below their cutoffs, or have no sensor.
@@ -423,7 +430,7 @@ struct CoolingPolicy {
     /// readings, so smoothing never delays them.
     static func curveSpeed(_ curve: FanCurve, _ temperatures: Temperatures, following: Double? = nil,
                            thermal: ThermalLevel, hardware: HardwareBounds) -> Double {
-        guard thermal == .nominal || thermal == .fair, temperatures.highest < stopLimit,
+        guard thermal == .nominal || thermal == .fair, temperatures.highest < curveLimit,
               othersBelowLimits(temperatures) else { return .infinity }
         let followed = following ?? temperatures.highest
         // Rounding must not leave the curve's range, which is within the fans' hardware range.
@@ -432,10 +439,9 @@ struct CoolingPolicy {
         return max(min(max(rounded, curve.points.first!.rpm), curve.points.last!.rpm),
                    SafeMinimum.rpm(at: temperatures.highest, hardware: hardware))
     }
-    /// Fixed speed for the current readings: the chosen RPM, raised to the safe minimum when it's warm, so Fixed gets
-    /// the same margin as Curve. Rounded up to 50 RPM so small temperature changes don't rewrite the target every update.
+    /// Fixed speed for the current readings: the chosen RPM, raised to Fixed's safe minimum when it's warm. Rounded up to 50 RPM so small temperature changes don't rewrite the target every update.
     static func fixedSpeed(_ rpm: Double, _ temperatures: Temperatures, hardware: HardwareBounds) -> Double {
-        let floor = SafeMinimum.rpm(at: temperatures.highest, hardware: hardware)
+        let floor = SafeMinimum.rpm(at: temperatures.highest, hardware: hardware, points: SafeMinimum.fixedPoints)
         return max(rpm, min((floor / 50).rounded(.up) * 50, hardware.maximum))
     }
     static func validateLimits(minimum: Double, maximum: Double, hardware: HardwareBounds) throws {
@@ -493,18 +499,18 @@ struct PowerRules: Equatable {
     /// Why `mode` can't be chosen right now, if a rule forbids it.
     func blocker(for mode: FanMode, on source: PowerSource) -> String? {
         guard autoOnBattery, source == .battery, mode != .auto else { return nil }
-        return "On battery, Baadgir keeps automatic cooling. Change this in Settings › Rules."
+        return "On battery, Fan Control keeps automatic cooling. Change this in Settings › Rules."
     }
 }
 
-/// A fan-mode request from a baadgir:// link, Shortcuts, or the command line.
+/// A fan-mode request from a fancontrol:// link, Shortcuts, or the command line.
 /// It goes through the same checks as choosing the mode in the app.
 enum RemoteCommand: Equatable {
     case auto, curve, maximum
     case manual(rpm: Double?)
     init(url: URL) throws {
-        guard url.scheme?.lowercased() == "baadgir", let name = url.host?.lowercased() else {
-            throw Failure("Not a Baadgir link")
+        guard url.scheme?.lowercased() == "fancontrol", let name = url.host?.lowercased() else {
+            throw Failure("Not a Fan Control link")
         }
         let rpm = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "rpm" }?.value
         switch name {
@@ -512,8 +518,8 @@ enum RemoteCommand: Equatable {
         case "curve": self = .curve
         case "max", "maximum": self = .maximum
         case "fixed": self = .manual(rpm: try rpm.map(Self.rpm))
-        // Never repeat the link's text: any web page can open one, and Baadgir would show it as its own words.
-        default: throw Failure("Unknown Baadgir command")
+        // Never repeat the link's text: any web page can open one, and Fan Control would show it as its own words.
+        default: throw Failure("Unknown Fan Control command")
         }
     }
     /// Parses command-line words such as `max` or `fixed 3000`.
@@ -538,10 +544,10 @@ enum RemoteCommand: Equatable {
     }
     var url: URL {
         switch self {
-        case .auto: return URL(string: "baadgir://off")!
-        case .curve: return URL(string: "baadgir://curve")!
-        case .maximum: return URL(string: "baadgir://max")!
-        case .manual(let rpm): return URL(string: "baadgir://fixed" + (rpm.map { "?rpm=\(Int($0.rounded()))" } ?? ""))!
+        case .auto: return URL(string: "fancontrol://off")!
+        case .curve: return URL(string: "fancontrol://curve")!
+        case .maximum: return URL(string: "fancontrol://max")!
+        case .manual(let rpm): return URL(string: "fancontrol://fixed" + (rpm.map { "?rpm=\(Int($0.rounded()))" } ?? ""))!
         }
     }
 }

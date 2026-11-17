@@ -147,7 +147,7 @@ rejects("Curve below hardware minimum") {
     try FanCurve(points([(50, 1000), (60, 3000), (70, 4000), (78, 5000)])).validate(hardware: hardware)
 }
 for bad in [[(50.0, 2000.0), (50, 3000), (70, 4000), (78, 5000)], [(50, 3000), (60, 2000), (70, 4000), (78, 5000)],
-            [(20, 2000), (60, 3000), (70, 4000), (78, 5000)], [(50, 2000), (60, 3000), (70, 4000), (80, 5000)],
+            [(20, 2000), (60, 3000), (70, 4000), (78, 5000)], [(50, 2000), (60, 3000), (70, 4000), (100, 5000)],
             [(50, 2000), (60, 3000), (70, 4000)], [(50, .nan), (60, 3000), (70, 4000), (78, 5000)]] {
     rejects("Malformed curve \(bad)") { _ = try FanCurve(points(bad)) }
 }
@@ -155,7 +155,7 @@ let balanced = CurvePreset.balanced.curve(for: hardware)
 check(balanced.points.first!.rpm == 1500 && balanced.points.last!.rpm == 5500, "Balanced curve spans the hardware range")
 check(CurvePreset.system.curve(for: hardware).points.allSatisfy { $0.rpm == SafeMinimum.rpm(at: $0.temperature, hardware: hardware) },
       "System curve sits on the safe minimum, leaving the fans to macOS until the floor asks for more")
-check([40.0, 55, 65, 70, 75, 79].allSatisfy { degrees in
+check([40.0, 55, 65, 70, 75, 79, 85, 90, 93, 95, 99].allSatisfy { degrees in
     let speeds = [CurvePreset.system, .balanced, .performance].map { $0.curve(for: hardware).rpm(at: degrees) }
     return speeds[0] <= speeds[1] && speeds[1] <= speeds[2]
 }, "Presets cool more from System to Balanced to Performance")
@@ -165,17 +165,27 @@ rejects("Curve target with missing speed") { _ = try CoolingTarget(encoded: "cur
 rejects("Curve target with text") { _ = try CoolingTarget(encoded: "curve 50 2000 60 3000 70 4000 78 fast") }
 let cool = try Temperatures(cpu: [55], gpu: [40])
 check(CoolingPolicy.curveSpeed(curve, cool, thermal: .nominal, hardware: hardware) == 2500, "Curve follows the hottest CPU/GPU sensor")
-check(CoolingPolicy.curveSpeed(curve, hot, thermal: .nominal, hardware: hardware) == .infinity, "Curve runs maximum at the stop limit")
+check(CoolingPolicy.curveSpeed(curve, hot, thermal: .nominal, hardware: hardware) == 5000, "Curve keeps following its points at 80°C")
+let veryHot = try Temperatures(cpu: [100], gpu: [60])
+check(CoolingPolicy.curveSpeed(curve, veryHot, thermal: .nominal, hardware: hardware) == .infinity, "Curve runs maximum at 100°C")
+let highCurve = try FanCurve(points([(60, 1500), (80, 1500), (90, 3000), (99, 5500)]))
+try highCurve.validate(hardware: hardware)
+checks += 1
+check(CoolingPolicy.curveSpeed(highCurve, try! Temperatures(cpu: [92], gpu: [50]), thermal: .nominal, hardware: hardware) == 3550,
+      "Curve points can go up to 99°C")
+check(balanced.rpm(at: 72) < 2000 && balanced.rpm(at: 80) < 2200, "Balanced stays near the fans' minimum below 80°C")
 check(CoolingPolicy.curveSpeed(curve, cool, thermal: .serious, hardware: hardware) == .infinity, "Curve runs maximum under thermal pressure")
 check(CoolingPolicy.curveSpeed(curve, hotBattery, thermal: .nominal, hardware: hardware) == .infinity, "Curve runs maximum with a hot battery")
 check(CoolingPolicy.curveSpeed(curve, hotSSD, thermal: .nominal, hardware: hardware) == .infinity, "Curve runs maximum with a hot SSD")
 let oddHardware = try HardwareBounds(ranges: [(1217, 5779)])
 let oddCurve = CurvePreset.balanced.curve(for: oddHardware)
-let oddSpeeds = [30.0, 55, 60, 79].map { try! CoolingPolicy.curveSpeed(oddCurve, Temperatures(cpu: [$0], gpu: [$0]), thermal: .nominal, hardware: oddHardware) }
+let oddSpeeds = [30.0, 55, 60, 79, 88, 96, 99].map { try! CoolingPolicy.curveSpeed(oddCurve, Temperatures(cpu: [$0], gpu: [$0]), thermal: .nominal, hardware: oddHardware) }
 check(oddSpeeds.allSatisfy { $0 >= oddHardware.minimum && $0 <= oddHardware.maximum },
       "Rounding never takes the curve outside a hardware range that isn't a multiple of 50")
-check([50.0, 65, 72, 75, 78, 79].map { SafeMinimum.rpm(at: $0, hardware: hardware) } == [1500, 1500, 2500, 3000, 3500, 3500],
-      "Safe minimum rises from the fans' minimum at 65°C to half their range at 78°C")
+check([50.0, 80, 90, 95, 99].map { SafeMinimum.rpm(at: $0, hardware: hardware) } == [1500, 1500, 2500, 3500, 3500],
+      "Curve's safe minimum rises from the fans' minimum at 80°C to half their range at 95°C")
+check([50.0, 65, 72, 75, 78, 79].map { SafeMinimum.rpm(at: $0, hardware: hardware, points: SafeMinimum.fixedPoints) }
+      == [1500, 1500, 2500, 3000, 3500, 3500], "Fixed's safe minimum rises from the fans' minimum at 65°C to half their range at 78°C")
 check(SafeMinimum.rpm(at: 50, hardware: oddHardware) == oddHardware.minimum, "Safe minimum starts at the fans' own minimum")
 try check(CoolingPolicy.fixedSpeed(1500, try Temperatures(cpu: [60], gpu: [50]), hardware: hardware) == 1500,
           "Fixed keeps the chosen speed while cool")
@@ -187,7 +197,8 @@ try check(CoolingPolicy.fixedSpeed(1500, try Temperatures(cpu: [70], gpu: [50]),
           .truncatingRemainder(dividingBy: 50) == 0, "Fixed rounds the safe minimum to 50 RPM so small changes don't rewrite the target")
 try check([60.0, 70, 74, 78, 79].allSatisfy { temperature in
     let speed = CoolingPolicy.fixedSpeed(oddHardware.minimum, try Temperatures(cpu: [temperature], gpu: [40]), hardware: oddHardware)
-    return speed >= SafeMinimum.rpm(at: temperature, hardware: oddHardware) && speed <= oddHardware.maximum
+    return speed >= SafeMinimum.rpm(at: temperature, hardware: oddHardware, points: SafeMinimum.fixedPoints)
+        && speed <= oddHardware.maximum
 }, "Fixed stays between the safe minimum and the fans' maximum, even with odd fan ranges")
 for odd in [oddHardware, hardware] {
     for preset in CurvePreset.allCases {
@@ -196,13 +207,13 @@ for odd in [oddHardware, hardware] {
     }
 }
 rejects("Curve point below the safe minimum") {
-    try FanCurve(points([(50, 2000), (60, 3000), (72, 2400), (78, 5000)])).validate(hardware: hardware)
+    try FanCurve(points([(50, 2000), (60, 2000), (90, 2400), (95, 5000)])).validate(hardware: hardware)
 }
 let lowCurve = try FanCurve(points([(40, 1500), (50, 1500), (60, 1500), (70, 2300)]))
 try lowCurve.validate(hardware: hardware)
 checks += 1
-try check(CoolingPolicy.curveSpeed(lowCurve, try Temperatures(cpu: [77], gpu: [50]), thermal: .nominal, hardware: hardware)
-        == SafeMinimum.rpm(at: 77, hardware: hardware), "Curve never runs below the safe minimum past its last point")
+try check(CoolingPolicy.curveSpeed(lowCurve, try Temperatures(cpu: [93], gpu: [50]), thermal: .nominal, hardware: hardware)
+        == 3100, "Curve never runs below the safe minimum past its last point")
 check(CoolingTarget.manual(rpm: 2000).isManual && !CoolingTarget.maximum.isManual && !CoolingTarget.curve(curve).isManual,
       "Only a manual target counts as already in Manual, so switching from Max or Curve uses the start limit")
 var controller = CurveController()
@@ -235,8 +246,11 @@ check(held.targets(desired: 3850, actual: [3800], minimums: [1000], maximums: [6
       "Any rise applies at once")
 var steady = SteadyTemperature()
 check(steady.update(60, now: 0) == 60, "Steady temperature starts at the first reading")
-let risen = steady.update(70, now: 6)
+let risen = steady.update(70, now: 10)
 check(risen > 66 && risen < 67, "A rise is mostly followed within its time constant")
+var spiking = SteadyTemperature()
+_ = spiking.update(60, now: 0)
+check(spiking.update(80, now: 3) < 66, "A 3-second spike of 20°C moves the steadied temperature less than 6°C")
 var falling = SteadyTemperature()
 _ = falling.update(70, now: 0)
 let fallen = falling.update(60, now: 6)
@@ -245,17 +259,17 @@ var swinging = SteadyTemperature()
 var swings: [Double] = []
 for second in 0..<300 { swings.append(swinging.update(second % 2 == 0 ? 60 : 71, now: Double(second))) }
 check(swings.suffix(60).allSatisfy { $0 > 67 && $0 < 70 }, "A reading swinging 60–71°C every second steadies within 3°C, toward the hot end")
-let swingingTemperatures = try Temperatures(cpu: [80], gpu: [40])
+let swingingTemperatures = try Temperatures(cpu: [100], gpu: [40])
 check(CoolingPolicy.curveSpeed(curve, swingingTemperatures, following: 60, thermal: .nominal, hardware: hardware) == .infinity,
       "The stop limit uses the raw reading, not the steadied one")
-check(CoolingPolicy.curveSpeed(curve, hot, following: 55, thermal: .nominal, hardware: hardware) == .infinity,
+check(CoolingPolicy.curveSpeed(curve, veryHot, following: 55, thermal: .nominal, hardware: hardware) == .infinity,
       "A steadied temperature never delays maximum at the stop limit")
 try check(CoolingPolicy.curveSpeed(curve, cool, following: 65, thermal: .nominal, hardware: hardware)
       == CoolingPolicy.curveSpeed(curve, try Temperatures(cpu: [65], gpu: [40]), thermal: .nominal, hardware: hardware)
       && CoolingPolicy.curveSpeed(curve, cool, following: 65, thermal: .nominal, hardware: hardware) != 2500,
       "The curve looks up the steadied temperature, not the raw one")
-try check(CoolingPolicy.curveSpeed(lowCurve, try Temperatures(cpu: [78], gpu: [40]), following: 60, thermal: .nominal, hardware: hardware)
-      == SafeMinimum.rpm(at: 78, hardware: hardware), "The safe minimum follows the raw reading, so smoothing never delays it")
+try check(CoolingPolicy.curveSpeed(lowCurve, try Temperatures(cpu: [95], gpu: [40]), following: 60, thermal: .nominal, hardware: hardware)
+      == SafeMinimum.rpm(at: 95, hardware: hardware), "The safe minimum follows the raw reading, so smoothing never delays it")
 var idle = CurveController()
 check(idle.targets(desired: 1200, actual: [0, 0], minimums: [1200, 1000], maximums: [6000, 5800], now: 0) == nil,
       "A stopped fan counts as its minimum, so the curve's lowest speed leaves it with macOS")
@@ -274,14 +288,14 @@ check(plugged.text == "25.8 W · adapter 28.3 W", "Power text with adapter")
 try check(try PowerReadings(system: 9, adapter: 0.1).adapter == nil, "Ignore adapter trickle when unplugged")
 rejects("Invalid power reading") { _ = try PowerReadings(system: .nan, adapter: nil) }
 rejects("Implausible power reading") { _ = try PowerReadings(system: 900, adapter: nil) }
-for (text, command) in [("baadgir://off", RemoteCommand.auto), ("baadgir://curve", .curve), ("BAADGIR://Max", .maximum),
-                        ("baadgir://maximum", .maximum), ("baadgir://fixed", .manual(rpm: nil)),
-                        ("baadgir://fixed?rpm=2500", .manual(rpm: 2500))] {
+for (text, command) in [("fancontrol://off", RemoteCommand.auto), ("fancontrol://curve", .curve), ("FANCONTROL://Max", .maximum),
+                        ("fancontrol://maximum", .maximum), ("fancontrol://fixed", .manual(rpm: nil)),
+                        ("fancontrol://fixed?rpm=2500", .manual(rpm: 2500))] {
     try check(try RemoteCommand(url: URL(string: text)!) == command, "Link \(text)")
     try check(try RemoteCommand(url: command.url) == command, "Link round trip \(text)")
 }
-for text in ["https://max", "baadgir://stop", "baadgir://fixed?rpm=fast", "baadgir://fixed?rpm=nan", "baadgir:max",
-             "baadgir://fixed?rpm=1e20", "baadgir://fixed?rpm=-1", "baadgir://auto", "baadgir://manual"] {
+for text in ["https://max", "fancontrol://stop", "fancontrol://fixed?rpm=fast", "fancontrol://fixed?rpm=nan", "fancontrol:max",
+             "fancontrol://fixed?rpm=1e20", "fancontrol://fixed?rpm=-1", "fancontrol://auto", "fancontrol://manual"] {
     rejects("Bad link \(text)") { _ = try RemoteCommand(url: URL(string: text)!) }
 }
 try check(try RemoteCommand(arguments: ["fixed", "2500"]) == .manual(rpm: 2500) && RemoteCommand(arguments: ["off"]) == .auto,
@@ -316,7 +330,7 @@ check(TemperatureReading.fanLevel(2400, minimum: 1000, maximum: 4000) == .normal
       TemperatureReading.fanLevel(2500, minimum: 1000, maximum: 4000) == .warm &&
       TemperatureReading.fanLevel(3400, minimum: 1000, maximum: 4000) == .hot &&
       TemperatureReading.fanLevel(2000, minimum: 0, maximum: 0) == nil, "Fan speed color bands follow the fans' range")
-let userFile = NSTemporaryDirectory() + "baadgir-test-" + UUID().uuidString
+let userFile = NSTemporaryDirectory() + "fancontrol-test-" + UUID().uuidString
 FileManager.default.createFile(atPath: userFile, contents: Data())
 check(isRootOwned("/bin/sh") && !isRootOwned(userFile) && !isRootOwned("/bin") && !isRootOwned("bin/sh") &&
       !isRootOwned("/nonexistent/helper"), "Only root-owned files in root-owned folders are trusted")
