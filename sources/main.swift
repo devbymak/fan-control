@@ -2180,9 +2180,25 @@ final class MenuApp: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNoti
             if let page = tabs.tabViewItems.first?.viewController { window.setContentSize(page.view.fittingSize) }
             window.center()
             settingsWindow = window
+            // Released on close: a hidden page would still redraw on every reading, and SwiftUI leaks an observation
+            // each time (about 1 GB a week), even for a page that is not on screen.
+            settingsClose = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window,
+                                                                   queue: .main) { [weak self] _ in
+                // After the close finishes, so the window isn't freed while AppKit is still closing it.
+                DispatchQueue.main.async { self?.releaseSettings() }
+            }
         }
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+    private var settingsClose: NSObjectProtocol?
+    private func releaseSettings() {
+        // Reopened before this ran: keep the window that is showing.
+        guard let window = settingsWindow, !window.isVisible else { return }
+        if let settingsClose { NotificationCenter.default.removeObserver(settingsClose) }
+        settingsClose = nil
+        window.contentViewController = nil
+        settingsWindow = nil
     }
     @objc func willSleep() { model.suspendForSleep() }
     @objc func didWake() { model.resumeAfterWake() }
